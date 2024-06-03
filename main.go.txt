@@ -1,0 +1,499 @@
+package main
+
+import (
+  "fmt"
+  "log"
+  "net/http"
+  urlpkg "net/url"
+  "os"
+  "sync/atomic"
+
+  utils "github.com/johnietre/utils/go"
+  "github.com/spf13/cobra"
+  webs "golang.org/x/net/websocket"
+)
+
+func main() {
+  rootCmd := cobra.Command{
+    Use: "nodes",
+    Args: cobra.ExactArgs(1),
+    Run: func(cmd *cobra.Command, args []string) {
+      addr := args[0]
+      srvr := &http.Server{
+        Addr: addr,
+        Handler: NewHandler(),
+      }
+    },
+  }
+  flags := rootCmd.Flags()
+  flags.Bool("static", false, "Whether the addr is static (node can be master)")
+
+  if err := rootCmd.Execute(); err != nil {
+    os.Exit(1)
+  }
+}
+
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+  path := r.URL.Path
+  if path != "" && path != "/" {
+    http.Error(w, "not found", http.StatusNotfound)
+    return
+  }
+  http.ServeFile(w, r, "index.html")
+}
+
+type WsMsg struct {
+  Ws *webs.Conn
+  Msg Message
+}
+
+/** APP **/
+
+type Handler struct {
+  Servant *ServantHandler
+  Master *MasterHandler
+  router *http.ServeMux
+
+  thisName string
+  thisNode *utils.RWLock[*Node]
+  nodes *utils.RWLock[NodeArr]
+  nodeNames *utils.SyncSet[string]
+}
+
+func NewHandler() *Handler {
+  app := &Handler{
+    thisNode: utils.NewRWLock[*Node](&Node{}),
+    nodes: utils.NewRWLock[NodeArr](NodeArr{}),
+    nodeNames: utils.NewSyncSet[string](),
+  }
+
+  app.servant = NewServantHandler(app)
+  app.master = NewMasterHandler(app)
+
+  app.router = http.NewServeMux()
+  app.router.HandleFunc("/", homeHandler)
+  app.router.Handle("/ws", &WsHandler{})
+  app.router.Handle("/master", &MasterHandler{})
+
+  return app
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+  h.router.ServeHTTP(w, r)
+}
+
+func (h *Handler) IsMaster() bool {
+  h.Servant.IsMaster()
+}
+
+type App = Handler
+
+/** SERVANT **/
+
+type ServantHandler struct {
+  app *App
+  conns utils.SyncSet[*webs.Conn]
+  msgCh chan WsMsg
+
+  masterWs atomic.Pointer[webs.Conn]
+}
+
+func (h *ServantHandler) IsMaster() bool {
+  // TODO
+}
+
+func (h *ServantHandler) handleMaster(ws *webs.Conn) {
+  defer ws.Close()
+  for {
+    var msg Message
+    if err := webs.JSON.Receive(ws, &msg); err != nil {
+      break
+    }
+    switch msg.Action {
+    case ActionConnect:
+      h.broadcast(msg)
+    case ActionDisconnect:
+    case ActionMessage:
+      h.broadcast(msg)
+    case ActionRename:
+    case ActionError:
+    }
+  }
+  // TODO
+}
+
+func NewServantHandler(app) *ServantHandler {
+  h := &ServantHandler{
+    app: app,
+    conns: utils.NewSyncSet[*webs.Conn]()
+    msgCh: make(chan WsMsg, 10),
+  }
+  go h.run()
+  return h
+}
+
+func (h *ServantHandler) run() {
+  for msg := range msgCh {
+    switch msg.Action {
+    case ActionConnect:
+    case ActionDisconnect:
+    case ActionMessage:
+      h.broadcast(msg)
+    case ActionRename:
+    default:
+      sendActionErr(ws, ActionError, "invalid action "+msg.Action)
+    }
+  }
+}
+
+func (h *ServantHandler) broadcast(msg Message) {
+  h.conns.Range(func(ws *webs.Conn) bool {
+    webs.JSON.Send(ws, msg)
+    return true
+  })
+}
+
+func (h *ServantHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+  webs.Handler(h.handler).ServeHTTP(w, r)
+}
+
+func (h *ServantHandler) handler(ws *webs.Conn) {
+  h.conns.Insert(ws)
+  defer h.conns.Remove(ws)
+  defer ws.Close()
+  for {
+    var msg Message
+    if err := webs.JSON.Receive(ws, &msg); err != nil {
+      break
+    }
+    h <- WsMsg{Ws: ws, Msg: msg}
+  }
+}
+
+/** MASTER **/
+
+type MasterHandler struct {
+  app *App
+  msgCh chan Message
+}
+
+func (h *MasterHandler) run() {
+  for msg := range msgCh {
+    var msg Message
+    if err := webs.JSON.Receive(ws, msg); err != nil {
+      break
+    }
+    switch msg.Action {
+    //case ActionConnect:
+    case ActionDisconnect:
+      break
+    default:
+      sendActionErr(ws, ActionError, "invalid action "+msg.Action)
+    }
+  }
+}
+
+func (h *MasterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+  webs.Handler(h.handler).ServeHTTP(w, r)
+}
+
+func (h *MasterHandler) handler(ws *webs.Conn) {
+  defer ws.Close()
+  node := h.HandleConnect(ws)
+  if node == nil {
+    return
+  }
+  h.broadcast(Message{
+    Action: ActionConnect,
+    Nodes: NodeArr{node},
+  })
+  // Listen
+  h.Handle(ws)
+  broadcast(Message{
+    Action: ActionDisconnect,
+    Content: node.Name,
+  })
+}
+
+func (h *MasterHandler) Handle(ws *webs.Conn) {
+  for {
+    var msg Message
+    if err := webs.JSON.Receive(ws, &msg); err != nil {
+      break
+    }
+    h <- WsMsg{Ws: ws, Msg: msg}
+  }
+}
+
+func (h *MasterHandler) HandleConnect(ws *webs.Conn) *Node {
+  var msg Message
+  // Receive the connect message
+  if err := webs.JSON.Receive(&msg); err != nil {
+    return nil
+  }
+  if msg.Action != ActionConnect {
+    sendActionErr(ws, ActionError, ExpectedConnect)
+    return nil
+  }
+  // TODO: move somewhere else?
+  // Check to make sure this node is the master
+  if !isMaster() {
+    // Send address of master
+    msg = Message{
+      Action: ActionError,
+      Content: ws.Request().URL.String(),
+      Error: NotMaster,
+    }
+    webs.JSON.Send(ws, msg)
+    return nil
+  }
+  // Get and check the node
+  if l := len(msg.Nodes); l != 1 {
+    sendActionErr(ws, ActionConnect, ExpectedNode)
+    return nil
+  }
+  node := msg.Nodes[0]
+  if node.Name == "" {
+    sendActionError(ws, ActionConnect, MissingName)
+    return nil
+  } else if node.Name == "SYSTEM" || !nodeNames.Insert(node.Name) {
+    sendActionError(ws, ActionConnect, NameExists)
+    return nil
+  }
+  node.ws = ws
+  // Notify others of the new node and add it to the list
+  nodes.Apply(func(np *NodeArr) {
+    node.ConnectedAt = time.Now().UnixNano()
+    msg := Message{Action: ActionNewNode, Nodes: NodeArr{node}}
+    for _, node := range *np {
+      webs.JSON.Send(ws, msg)
+    }
+    *np = append(*np, node)
+    bubbleNodes(*np)
+    // Send all nodes to newly connected node
+    msg = Message{Action: ActionConnect, Nodes: *np}
+    webs.JSON.Send(ws, msg)
+  })
+  return node
+}
+
+func (h *MasterHandler) connect(addr string) error {
+  return h.tryConnect(addr, nil)
+}
+
+func (h *MasterHandler) tryConnect(addr string, triedAddrs []string) error {
+  // Check to make sure the URL hasn't been tried
+  if utils.SearchSlice(triedAddrs, addr) != -1 {
+    return fmt.Errorf("cycle detected when searching for master")
+  }
+  // Parse the URL
+  url, err := url.Parse(addr)
+  if err != nil {
+    return err
+  }
+  origin := ""
+  if url.Scheme == "wss" {
+    origin = "https://127.0.0.1"
+  } else {
+    origin = "http://127.0.0.1"
+  }
+  ws, err := webs.Dial(url.String(), "", origin)
+  if err != nil {
+    return err
+  }
+  var e error
+  // Send this node to master
+  h.app.thisNode.RApply(func(np **Node) {
+    msg := Message{Action: ActionConnect, Nodes: NodeArr{*np}}
+    if err := webs.JSON.Send(ws, msg); err != nil {
+      e = err
+      return
+    }
+  })
+  if e != nil {
+    return e
+  }
+  // Get the response
+  var msg Message
+  if err := webs.JSON.Receive(ws, &msg); err != nil {
+    return err
+  }
+  if msg.Action != ActionConnect {
+    if msg.Action != ActionError {
+      return fmt.Errorf("expected %s, got %s", ActionConnect, msg.Action)
+    }
+    // TODO
+    switch msg.Error {
+    case ExpectedConnect:
+    case ExpectedNode:
+    case MissingName:
+    case NameExists:
+    case NotMaster:
+      newAddr, ok := msg.Content.(string)
+      if !ok || newAddr == "" {
+        // TODO
+      }
+      return tryConnect(newAddr, append(triedAddrs, addr))
+    default:
+    }
+    return fmt.Errorf("received error: %s", msg.Error)
+  } else if msg.Error != "" {
+    return fmt.Errorf("received connect error: %s", msg.Error)
+  } else if l := len(msg.Nodes); l < 2 {
+    return fmt.Errorf("expected at least 2 nodes, got %d", l)
+  }
+  // Set this node
+  thisNode.Apply(func(np **Node) {
+    for _, node := range msg.Nodes {
+      if node.Name == (*np).Name {
+        *np = node
+        return
+      }
+    }
+    e = fmt.Errorf("this node not included in received nodes")
+  })
+  if e != nil {
+    return err
+  }
+  // Set the rest of the nodes
+  nodes.Apply(func(np *NodeArr) {
+    *np = msg.Nodes
+  })
+  return nil
+}
+
+// TODO: Args
+func listenMaster() {
+  for {
+    ws := masterWs.Load()
+    // TODO: Check ws
+    for {
+      var msg Message
+      if err := webs.JSON.Receive(ws, &msg); err != nil {
+        // TODO
+        break
+      }
+      switch msg.Action {
+      case ActionConnect:
+      case ActionDisconnect:
+        name, ok := msg.Content.(string)
+        if !ok {
+          log.Print("missing name in disconenct message")
+          continue
+        }
+      case ActionError:
+        // TODO
+      default:
+        // TODO
+        log.Print("received unknown action: ", msg.Action)
+      }
+    }
+    masterAddr := ""
+    nodes.Apply(func(np *NodeArr) {
+      i := findNextMasterIndex(*np)
+      if i == -1 {
+        // TODO
+        log.Fatal("no next master found")
+      }
+      next := (*np)[i]
+      if next.Name == thisName {
+        masterWs.Store(nil)
+      } else {
+        masterAddr = next.Addr
+      }
+    })
+    if err := connect(masterAddr); err != nil {
+      log.Fatal("Error connecting to master: ", err)
+    }
+  }
+}
+
+type NodeArr = []*Node
+
+type Node struct {
+  Name string `json:"name"`
+  Addr string `json:"addr,omitempty"`
+  IsMaster bool `json:"isMaster,omitempty"`
+  IsStatic bool `json:"isStatic,omitempty"`
+  ConnectedAt int64 `json:"conectedAt,omitempty"`
+
+  ws *webs.Conn
+}
+
+func isMaster() bool {
+  return masterWs.Load() != nil
+}
+
+type Message struct {
+  Action string `json:"action"`
+  Nodes NodeArr `json:"nodes,omitempty"`
+  Content any `json:"content,omitempty"`
+  Error string `json:"error,omitempty"`
+}
+
+const (
+  ActionConnect = "connect"
+  ActionDisconnect = "disconnect"
+  ActionMessage = "message"
+  ActionRename = "rename"
+  ActionError = "error"
+)
+
+const (
+  ExpectedConnect = "expected action "+ActionConnect
+  ExpectedNode = "expected one node"
+  MissingName = "missing node name"
+  NameExists = "node name already exists"
+  NotMaster = "not master"
+)
+
+type NotMasterErr struct {
+  Addr string
+}
+
+func (nme *NotMasterErr) Error() string {
+  return "node was not master, correct master is at "+nme.Addr
+}
+
+func GetMasterAddr(err error) (string, bool) {
+  if nme, ok := err.(*NotMasterErr); ok {
+    return nme.Addr, true
+  }
+  return "", false
+}
+
+func sendActionError(ws *webs.Conn, action, msg string) error {
+  return webs.JSON.Send(ws, Message{Action: action, Error: msg})
+}
+
+func broadcast(msg Message) {
+  nodes.RApply(func(np *NodeArr) {
+    for _, node := range *np {
+      if node.ws != nil {
+        webs.JSON.Send(node.ws, msg)
+      }
+    }
+  })
+}
+
+func bubbleNodes(nodes NodeArr) {
+  l, swapped := len(nodes), true
+  for end := l; swapped && end != 0; end-- {
+    swapped = false
+    for i := 1; i < end; i++ {
+      if nodes[i].ConnectedAt < nodes[i-1].ConnectedAt {
+        swapped = true
+        nodes[i-1], nodes[i] = nodes[i], nodes[i-1]
+      }
+    }
+  }
+}
+
+func findNextMasterIndex(nodes NodeArr) int {
+  for i, node := range nodes {
+    if node.IsStatic && !node.IsMaster {
+      return i
+    }
+  }
+  return -1
+}

@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+
+<html lang="en-US">
+
+<head>
+  <title>Index</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://unpkg.com/vue@3"></script>
+<style>
+.center-text {
+  text-align: center;
+}
+
+#send-msg-div {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+#send-msg-div > * {
+  display: block;
+}
+</style>
+</head>
+
+<body>
+<div id="app">
+
+<h1 class="center-text">Name: {{.name}}</h1>
+<h1 class="center-text" v-if="!connected">MASTER</h1>
+
+<div id="connect-div">
+  <input type="text" placeholder="URL" v-model="masterAddr">
+  <button v-if="connected" @click="connect">Connect</button>
+  <button v-else @click="disconnect">Disconnect</button>
+</div>
+
+<div id="msg-div">
+  <div id="send-msg-div">
+    <input type="text" placeholder="Message" v-model="msgContent">
+    <button @click="sendMsg">Send</button>
+  </div>
+
+  <hr style="width:75%">
+
+  <p v-for="msg in messages">
+  <span>{{msg.from}}</span> =&gt; <span>{{msg.Content}}</span>
+  </p>
+</div>
+
+</div>
+
+<script>
+class Action {
+  static Connect = "connect";
+  static Disconnect = "disconnect";
+  static Message = "message";
+  static Rename = "rename";
+  static Error = "error";
+};
+
+function newMessage() {
+  return {
+    from: "",
+    content: "",
+  };
+}
+
+const App = {
+  data() {
+    const url = new URL("/ws", document.location.href);
+    url.protocol = (url.protocol == "https") ? "wss" : "ws";
+    const ws = new WebSocket(url.toString());
+    ws.onopen = this.openHandler;
+    ws.onmessage = this.msgHandler;
+    ws.onerror = this.errHandler;
+    ws.onclose = this.closeHandler;
+    return {
+      name: "",
+      tempName: "",
+
+      isMaster: false,
+      connected: false,
+      masterAddr: "",
+
+      msgContent: "",
+      messages: [],
+
+      ws: ws,
+      _blank: undefined
+    };
+  },
+
+  methods: {
+    sendMsg() {
+      const err = this.send({action: Action.Message, content: this.msgContent});
+      if (err) {
+        alert(`Error sending message: ${e}`);
+      } else {
+        this.msgContent = "";
+      }
+    },
+    send(msg) {
+      try {
+        this.ws.send(msg);
+      } catch (e) {
+        console.log(`error sending message: ${e}`);
+        return e;
+      }
+    },
+    connect() {
+      const err = this.send({action: Action.Connect, content: this.masterAddr});
+      if (err) {
+        alert(`Error connecting: ${e}`);
+      }
+    },
+    disconnect() {
+      const err = this.send({action: Action.Disconnect});
+      if (err) {
+        alert(`Error disconnecting: ${e}`);
+      }
+    },
+
+    openHandler() {},
+    msgHandler(ev) {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (e) {
+        console.log(`error parsing message: ${e}`);
+        console.log(`bad message: ${ev.data}`);
+      }
+      if (typeof msg.action !== "string") {
+        console.log(`no message action`);
+        console.log(`bad message: ${msg}`);
+        return;
+      }
+      switch (msg.action) {
+      case Action.Connect:
+          if (typeof msg.error === "string") {
+            alert(`Error connecting: ${msg.error}`);
+            return;
+          }
+          if (typeof msg.nodes !== "object") {
+            console.log(`no message nodes`);
+            console.log(`bad message: ${msg}`);
+            return;
+          }
+          let thisConnected = false;
+          for (const node of msg.nodes) {
+            if (node.name == this.name) {
+              thisConnected = true;
+              this.isMaster = node.isMaster;
+            }
+            this.messages.push({
+              from: "SYSTEM",
+              content: `CONNECTED: ${node.name} (${node.addr})`
+            });
+          }
+          if (!thisConnected) {
+            return;
+          }
+          if (typeof msg.content !== "string") {
+            console.log(`no message content`);
+            console.log(`bad message: ${msg}`);
+            return;
+          }
+          this.connected = true;
+          this.masterAddr = msg.content;
+          // TODO
+          alert(`Connected to ${this.masterAddr}`);
+      case Action.Disconnect:
+          if (typeof msg.nodes !== "object") {
+            console.log(`no message nodes`);
+            console.log(`bad message: ${msg}`);
+            return;
+          }
+          let thisDisconnected = false;
+          for (const node of msg.nodes) {
+            if (node.name == this.name) {
+              thisDisconnected = true;
+            }
+            this.messages.push({
+              from: "SYSTEM",
+              content: `DISCONNECTED: ${node.name} (${node.addr})`
+            });
+          }
+          if (!thisDisconnected) {
+            return;
+          }
+          this.connected = false;
+          this.messages = [];
+          alert(`Disconnected`);
+      case Action.Message:
+        if (typeof msg.content !== "string") {
+          console.log(`no message content`);
+          console.log(`bad message: ${msg}`);
+          return;
+        }
+        let i = msg.content.indexOf("|");
+        if (i == -1) {
+          console.log(`expected "|" in message content`);
+          console.log(`bad message: ${msg}`);
+          return;
+        }
+        this.messages.push({
+          from: msg.content.substr(0, i),
+          content: msg.content.substr(i + 1),
+        });
+      case Action.Rename:
+          if (typeof msg.error === "string") {
+            alert(`Error renaming: ${msg.error}`);
+            return;
+          }
+          if (typeof msg.content !== "string") {
+            console.log(`no message content`);
+            console.log(`bad message: ${msg}`);
+            return;
+          }
+          this.name = msg.content;
+          alert(`Renamed to ${this.name}`);
+      case Action.Error:
+          console.log(`received error: ${msg.error}`);
+          alert(`Error: ${msg.error}`);
+      default:
+        console.log(`unknown action: ${msg.action}`);
+        console.log(`bad message: ${msg}`);
+      }
+    },
+    errHandler(ev) {
+      console.log(`websocket error: ${ev}`);
+    },
+    closeHandler(ev) {
+      alert("Connection closed");
+      console.log(`websocket closed: ${ev}`);
+    },
+
+    _blankMethod() {}
+  }
+};
+const app = Vue.createApp(App);
+app.mount("#app");
+</script>
+</body>
+
+</html>

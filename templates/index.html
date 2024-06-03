@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+
+<html lang="en-US">
+
+<head>
+  <title>Nodes</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://unpkg.com/vue@3"></script>
+  <script src="/static/js/index.js" defer></script>
+<style>
+.center-text {
+  text-align: center;
+}
+
+#connect-div {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+#connect-div > * {
+  display: block;
+}
+
+#send-msg-div {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+#send-msg-div > * {
+  display: block;
+}
+</style>
+</head>
+
+<body>
+<div id="app">
+
+<h1 class="center-text">Name: {{name}}</h1>
+<h1 class="center-text" v-if="isMaster">MASTER</h1>
+
+<div id="connect-div">
+  <input type="text" placeholder="URL" class="center-text" v-model="masterAddr">
+  <button v-if="!connected" @click="connect">Connect</button>
+  <button v-else @click="disconnect">Disconnect</button>
+</div>
+
+<br style="height:10px">
+
+<div id="msg-div">
+  <div id="send-msg-div">
+    <input type="text" placeholder="Message" @keyup.enter="sendMsg" v-model="msgContent">
+    <button @click="sendMsg">Send</button>
+  </div>
+
+  <hr style="width:75%">
+
+  <p v-for="msg in messages">
+  <span>{{msg.from}}</span> =&gt; <span>{{msg.content}}</span>
+  </p>
+</div>
+
+</div>
+
+</body>
+
+</html>
